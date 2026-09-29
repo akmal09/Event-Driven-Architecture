@@ -1,0 +1,139 @@
+@startuml architecture
+' ============================================================================
+'  Direct API vs Kafka - Load Test Architecture (7 Cloud VMs)
+'  Order Service (OS) -> Payment Service (PS), 3 flows compared:
+'    A. Direct HTTP            (OS calls PS synchronously)
+'    B. Kafka + DB polling     (OS publishes, then polls PS's DB for status)
+'    C. Kafka + result event   (OS publishes, PS publishes result back)
+'  Only one flow is active per test run (switched by config).
+'  Every component runs on its own VM, so every flow pays a real network hop.
+' ============================================================================
+
+title Direct API vs Kafka - Load Test Architecture (7 VMs)
+
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam shadowing false
+skinparam roundCorner 10
+skinparam nodesep 60
+skinparam ranksep 70
+skinparam ArrowThickness 1.5
+
+skinparam cloud {
+  BackgroundColor #F7F9FC
+  BorderColor #8A9BB5
+}
+skinparam rectangle {
+  BackgroundColor #FFFFFF
+  BorderColor #8A9BB5
+}
+skinparam node {
+  BackgroundColor #EEF3FB
+  BorderColor #4A6FA5
+}
+skinparam component {
+  BackgroundColor #FFFFFF
+  BorderColor #4A6FA5
+}
+skinparam queue {
+  BackgroundColor #FFF4E5
+  BorderColor #D98A1F
+}
+skinparam database {
+  BackgroundColor #EAF6EE
+  BorderColor #3C8D5A
+}
+skinparam note {
+  BackgroundColor #FAFAFA
+  BorderColor #AAAAAA
+}
+
+actor "Engineer\n(laptop)" as engineer
+
+cloud "Cloud Provider - single region (e.g. asia-southeast2)" as provider {
+  rectangle "VPC 10.0.0.0/16 - private subnet, VM-to-VM traffic stays inside the VPC" as vpc {
+
+    node "**VM1 - load-gen**\n2 vCPU / 2 GB - zone A" as vm1 {
+      component "k6\nramp 100 > 500 > 1000 VUs" as k6
+    }
+
+    node "**VM2 - order**\n2 vCPU / 2 GB - zone A" as vm2 {
+      component "Order Service (OS)\n:8080" as os
+    }
+
+    node "**VM3 - payment**\n**1 vCPU** / 2 GB - zone B\n(deliberately limited)" as vm3 {
+      component "Payment Service (PS)\n:8081\nDB pool 10" as ps
+    }
+
+    node "**VM4 - external gateway**\n1 vCPU / 1 GB - zone B" as vm4 {
+      component "Payment Gateway Mock\n(stands in for bank / Midtrans / Xendit)\n:8082 - 150-300 ms, 5% errors" as bank
+    }
+
+    node "**VM5 - broker: Kafka (KRaft)**\n2 vCPU / 4 GB - zone A" as vm5 {
+      queue "topic: payment.requested\n(N partitions, + payment.dlq)" as t_req
+      queue "topic: payment.completed\n/ payment.failed" as t_res
+    }
+
+    node "**VM6 - database: PostgreSQL**\n2 vCPU / 4 GB - zone B" as vm6 {
+      database "orders_db\n(owned by OS)" as orders_db
+      database "payments_db\n(owned by PS)\nrequested_at / started_at /\ncompleted_at" as payments_db
+    }
+
+    node "**VM7 - observability**\n2 vCPU / 6 GB - zone B" as vm7 {
+      component "grafana/otel-lgtm\n\nOTel Collector :4317\nTempo (traces) | Loki (logs)\nMimir (metrics) | Grafana :3000" as lgtm
+    }
+  }
+}
+
+note bottom of vm7
+  **Telemetry from every VM (OTLP):**
+  VM1 k6 metrics | VM2/VM3 traces, metrics, logs
+  VM4 gateway latency | VM5 Kafka consumer lag
+  VM6 Postgres connections & query rate
+  + host CPU / memory for all VMs
+end note
+
+' ---------------------------------------------------------------- layout hints
+vm1 -[hidden]down- vm2
+vm2 -[hidden]down- vm3
+vm3 -[hidden]down- vm4
+t_req -[hidden]down- t_res
+orders_db -[hidden]right- payments_db
+
+' ---------------------------------------------------------------- operator access
+engineer -[#777777,dashed]-> vpc : Terraform apply/destroy\nSSH (run k6) | SSH tunnel (Grafana)
+
+' ---------------------------------------------------------------- load (all flows)
+k6 -[#333333,bold]down-> os : HTTP POST /orders
+
+' ---------------------------------------------------------------- flow A: direct
+os -[#1F6FEB,bold]down-> ps : <color:#1F6FEB>**A** HTTP POST /payments</color>\n<color:#1F6FEB>OS blocks, timeout 1 s</color>
+
+' ---------------------------------------------------------------- flows B & C: via Kafka
+os -[#D98A1F,bold]-> t_req : <color:#D98A1F>**B/C** publish</color>
+t_req -[#D98A1F,bold]-> ps : <color:#D98A1F>**B/C** consume</color>\n<color:#D98A1F>pull at own pace</color>
+os -[#C0392B,dashed,thickness=2]-> payments_db : <color:#C0392B>**B** poll payment status</color>\n<color:#C0392B>shared-DB anti-pattern</color>
+ps -[#8E44AD,bold]-> t_res : <color:#8E44AD>**C** publish result</color>
+t_res -[#8E44AD,bold]-> os : <color:#8E44AD>**C** consume result</color>
+
+' ---------------------------------------------------------------- shared by all flows
+os -[#333333]-> orders_db : write order
+ps -[#333333]down-> bank : charge
+ps -[#333333]-> payments_db : write payment status
+
+legend right
+  |= Line |= Meaning |
+  | <color:#333333>**black**</color> | Load from k6 + calls shared by every flow |
+  | <color:#1F6FEB>**blue**</color> | **Flow A** - Direct HTTP (synchronous) |
+  | <color:#D98A1F>**orange**</color> | **Flow B / C** - OS > Kafka > PS |
+  | <color:#C0392B>**red dashed**</color> | **Flow B** - OS polls PS's database |
+  | <color:#8E44AD>**purple**</color> | **Flow C** - PS > Kafka > OS (result event) |
+  ----
+  **Scenarios per flow:** PS copes | PS overloaded | PS down 10 s | ramp 100 > 1000
+  **Runs:** each scenario 3-5x, median reported
+  **Source of truth:** k6 results + DB timestamps
+endlegend
+
+footer Only one flow is active per test run; the others are switched off by config.
+
+@enduml

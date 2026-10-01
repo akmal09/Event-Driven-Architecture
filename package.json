@@ -1,0 +1,14 @@
+{
+  "name": "eda-direct-vs-broker",
+  "version": "1.0.0",
+  "description": "Benchmark: 100 direct API requests vs 100 messages through a RabbitMQ queue",
+  "private": true,
+  "scripts": {
+    "broker:up": "docker compose up -d --wait",
+    "broker:down": "docker compose down",
+    "bench": "node src/benchmark.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.4"
+  }
+}

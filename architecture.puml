@@ -9,7 +9,7 @@
 '  Every component runs on its own VM, so every flow pays a real network hop.
 ' ============================================================================
 
-title Direct API vs Kafka - Load Test Architecture (7 VMs)
+title Direct API vs Kafka - Load Test Architecture (7 VMs on GCP)
 
 skinparam defaultFontName "Segoe UI"
 skinparam defaultFontSize 12
@@ -50,36 +50,36 @@ skinparam note {
 
 actor "Engineer\n(laptop)" as engineer
 
-cloud "Cloud Provider - single region (e.g. asia-southeast2)" as provider {
-  rectangle "VPC 10.0.0.0/16 - private subnet, VM-to-VM traffic stays inside the VPC" as vpc {
+cloud "Google Cloud (Free Trial, 8 vCPU total) - region asia-southeast2 (Jakarta)" as provider {
+  rectangle "VPC loadtest-vpc 10.0.0.0/16 - no public IPs, outbound via Cloud NAT, SSH via IAP" as vpc {
 
-    node "**VM1 - load-gen**\n2 vCPU / 2 GB - zone A" as vm1 {
-      component "k6\nramp 100 > 500 > 1000 VUs" as k6
+    node "**VM1 - load-gen** 10.0.0.11\nn1-standard-1 (1 vCPU / 3.75 GB) - zone a" as vm1 {
+      component "k6\narrival-rate scenarios\nS1-S5 (up to 150 req/s)" as k6
     }
 
-    node "**VM2 - order**\n2 vCPU / 2 GB - zone A" as vm2 {
+    node "**VM2 - order** 10.0.0.12\nn1-standard-1 (1 vCPU / 3.75 GB) - zone a" as vm2 {
       component "Order Service (OS)\n:8080" as os
     }
 
-    node "**VM3 - payment**\n**1 vCPU** / 2 GB - zone B\n(deliberately limited)" as vm3 {
-      component "Payment Service (PS)\n:8081\nDB pool 10" as ps
+    node "**VM3 - payment** 10.0.0.13\nn1-standard-1 (1 vCPU / 3.75 GB) - zone b" as vm3 {
+      component "Payment Service (PS)\n:8081\n**max 10 in-flight payments**\n(~44 payments/s capacity)" as ps
     }
 
-    node "**VM4 - external gateway**\n1 vCPU / 1 GB - zone B" as vm4 {
+    node "**VM4 - external gateway** 10.0.0.14\nn1-standard-1 (1 vCPU / 3.75 GB) - zone b" as vm4 {
       component "Payment Gateway Mock\n(stands in for bank / Midtrans / Xendit)\n:8082 - 150-300 ms, 5% errors" as bank
     }
 
-    node "**VM5 - broker: Kafka (KRaft)**\n2 vCPU / 4 GB - zone A" as vm5 {
-      queue "topic: payment.requested\n(N partitions, + payment.dlq)" as t_req
+    node "**VM5 - broker: Kafka (KRaft)** 10.0.0.15\nn1-standard-1 (1 vCPU / 3.75 GB) - zone a" as vm5 {
+      queue "topic: payment.requested\n(10 partitions, + payment.dlq)" as t_req
       queue "topic: payment.completed\n/ payment.failed" as t_res
     }
 
-    node "**VM6 - database: PostgreSQL**\n2 vCPU / 4 GB - zone B" as vm6 {
+    node "**VM6 - database: PostgreSQL** 10.0.0.16\nn1-standard-1 (1 vCPU / 3.75 GB) - zone b" as vm6 {
       database "orders_db\n(owned by OS)" as orders_db
-      database "payments_db\n(owned by PS)\nrequested_at / started_at /\ncompleted_at" as payments_db
+      database "payments_db\n(owned by PS)\nrequested_at / started_at /\ncompleted_at (DB clock)" as payments_db
     }
 
-    node "**VM7 - observability**\n2 vCPU / 6 GB - zone B" as vm7 {
+    node "**VM7 - observability** 10.0.0.17\ne2-standard-2 (2 vCPU / 8 GB) - zone b" as vm7 {
       component "grafana/otel-lgtm\n\nOTel Collector :4317\nTempo (traces) | Loki (logs)\nMimir (metrics) | Grafana :3000" as lgtm
     }
   }
@@ -101,7 +101,7 @@ t_req -[hidden]down- t_res
 orders_db -[hidden]right- payments_db
 
 ' ---------------------------------------------------------------- operator access
-engineer -[#777777,dashed]-> vpc : Terraform apply/destroy\nSSH (run k6) | SSH tunnel (Grafana)
+engineer -[#777777,dashed]-> vpc : Cloud Shell: gcloud create/delete\nIAP SSH (run k6) | IAP tunnel (Grafana)
 
 ' ---------------------------------------------------------------- load (all flows)
 k6 -[#333333,bold]down-> os : HTTP POST /orders
@@ -129,8 +129,9 @@ legend right
   | <color:#C0392B>**red dashed**</color> | **Flow B** - OS polls PS's database |
   | <color:#8E44AD>**purple**</color> | **Flow C** - PS > Kafka > OS (result event) |
   ----
-  **Scenarios per flow:** PS copes | PS overloaded | PS down 10 s | ramp 100 > 1000
-  **Runs:** each scenario 3-5x, median reported
+  **Scenarios per flow:** S1 PS copes (20/s) | S2 burst of 100 | S3 overloaded (100/s)
+  S4 PS down 10 s | S5 ramp 10 > 150 req/s
+  **Runs:** each scenario 3-5x, flows interleaved, median reported
   **Source of truth:** k6 results + DB timestamps
 endlegend
 

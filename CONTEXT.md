@@ -70,19 +70,25 @@ OS <- Kafka: consume result -> update order in orders_db
 
 Topics: `payment.requested` (N partitions), `payment.completed`, `payment.failed`, `payment.dlq`.
 
-## 4. Infrastructure: 7 cloud VMs
+## 4. Infrastructure: 7 VMs on Google Cloud (Free Trial)
 
-**One cloud provider, one region, one VPC, private subnet**, spread across 2 availability zones. It is deliberately **not multi-cloud**: traffic between providers crosses the public internet, and the high latency and jitter would hide the architectural difference. It also adds egress cost and is not how production OS/PS/Kafka are deployed.
+**Google Cloud, Free Trial account, region `asia-southeast2` (Jakarta), one VPC, private subnet**, spread across zones a and b. It is deliberately **not multi-cloud**: traffic between providers crosses the public internet, and the high latency and jitter would hide the architectural difference. It also adds egress cost and is not how production OS/PS/Kafka are deployed.
 
-| VM | Component | Size | Zone |
-|---|---|---|---|
-| VM1 | k6 load generator | 2 vCPU / 2 GB | A |
-| VM2 | Order Service | 2 vCPU / 2 GB | A |
-| VM3 | Payment Service | **1 vCPU** / 2 GB (deliberately limited), DB pool 10 | B |
-| VM4 | Payment Gateway Mock | 1 vCPU / 1 GB | B |
-| VM5 | Kafka (KRaft) | 2 vCPU / 4 GB | A |
-| VM6 | PostgreSQL (`orders_db`, `payments_db`) | 2 vCPU / 4 GB | B |
-| VM7 | Observability: `grafana/otel-lgtm` | 2 vCPU / 6 GB | B |
+**Free-trial constraints drive the sizing:** the trial **cannot request quota increases** and is commonly capped at **8 vCPUs per region**. So the lab totals exactly 8 vCPUs, using **dedicated-core** types only. Shared-core e2-micro/small/medium burst unpredictably and would make results noisy.
+
+| VM | Component | Machine type | Zone | Internal IP |
+|---|---|---|---|---|
+| VM1 | k6 load generator | n1-standard-1 (1 vCPU / 3.75 GB) | a | 10.0.0.11 |
+| VM2 | Order Service | n1-standard-1 | a | 10.0.0.12 |
+| VM3 | Payment Service | n1-standard-1 | b | 10.0.0.13 |
+| VM4 | Payment Gateway Mock | n1-standard-1 | b | 10.0.0.14 |
+| VM5 | Kafka (KRaft) | n1-standard-1 | a | 10.0.0.15 |
+| VM6 | PostgreSQL (`orders_db`, `payments_db`) | n1-standard-1 | b | 10.0.0.16 |
+| VM7 | Observability: `grafana/otel-lgtm` | e2-standard-2 (2 vCPU / 8 GB) | b | 10.0.0.17 |
+
+**PS's bottleneck is a concurrency limit, not CPU:** at most **10 in-flight payments** in every flow (gateway client pool = DB pool = Kafka consumer concurrency = 10; `payment.requested` has 10 partitions). With 150–300 ms gateway latency, that's **≈ 44 payments/s** capacity. Load levels are derived from this number.
+
+Networking: no public IPs, outbound through **Cloud NAT**, SSH and the Grafana tunnel through **IAP**, operated from **Cloud Shell**. The full runbook is in [`load_test_execution_plan_use_gcp.md`](load_test_execution_plan_use_gcp.md).
 
 **Why every component has its own VM:**
 - **Fairness:** if OS and PS shared a VM, the direct flow would skip the real network hop while the Kafka flows would not. That would bias the result towards Flow A.
@@ -91,15 +97,23 @@ Topics: `payment.requested` (N partitions), `payment.completed`, `payment.failed
 - **Clean per-component metrics** for dashboards and screenshots.
 - **The load generator is always isolated,** so it never steals CPU from the system under test.
 
-Provisioning is planned with **Terraform** (apply → run → destroy in the same session). Operators access the VMs via SSH, and Grafana via an SSH tunnel. Expected cost is roughly $1–2 per hour of testing.
+Provisioning uses **gcloud CLI commands from Cloud Shell** (see the execution plan); Terraform is a possible later upgrade. Each VM gets a startup script that installs Docker, and every component runs via Docker Compose. Expected cost is about **$0.5 per running hour**, roughly $5–10 for the whole test, well within the $300 credit.
 
 ## 5. Test design
 
-**Scenarios, run for each flow:**
-1. **PS copes:** capacity is enough and the timeout is generous. Direct is expected to win or tie.
-2. **PS overloaded:** 100 concurrent requests against the 1 s client timeout.
-3. **PS down for 10 s:** direct should fail; Kafka should buffer and recover.
-4. **Load ramp:** 100 → 500 → 1000 virtual users, to find where direct breaks.
+**Scenarios, run for each flow** (k6 **arrival-rate** executors, to avoid coordinated omission):
+
+| ID | Scenario | Load |
+|---|---|---|
+| S1 | PS copes | 20 req/s × 60 s (~45% of capacity). Direct is expected to tie or win |
+| S2 | **Burst of 100** (the original question) | 100 VUs × 1 iteration, all at once |
+| S3 | PS overloaded | 100 req/s × 60 s (~2.3× capacity) |
+| S4 | PS down 10 s | 20 req/s × 60 s, PS stopped at t=20 s |
+| S5 | Ramp to breaking point | 10 → 150 req/s over 3 min |
+
+OS settings: in flow A, a 1 s timeout to PS with no automatic retry; in flow B, polling every 200 ms, giving up after 30 s.
+Every run starts with a reset (truncate tables, recreate topics, restart services, 30 s cool-down). Flows are interleaved across runs.
+**Validity checks:** k6 CPU < 70%, OS CPU < 80%, gateway CPU < 70%, k6 `dropped_iterations` = 0. Otherwise the run is invalid.
 
 Discussed as optional extras: Kafka with 1 partition vs N partitions (partitions cap consumer parallelism), and duplicate delivery with vs without an idempotency key (at-least-once delivery can double-charge).
 
@@ -107,6 +121,8 @@ Discussed as optional extras: Kafka with 1 partition vs N partitions (partitions
 - **OS response time** (caller latency): p50, p95, p99.
 - **End-to-end payment time** (request until status final), from DB timestamps `requested_at`, `started_at` and `completed_at`.
 - **Queue wait time:** `started_at − requested_at`.
+- All timestamps come from the **DB clock** (`clock_timestamp()`), with `requested_at` = `orders.created_at`, passed from OS to PS. One clock means no skew between VMs.
+- **Inconsistent orders:** OS marked the order failed or timed out, but the payment actually succeeded (expected in flow A).
 - Success, timeout and error counts; lost payments; total time for all N; duplicate charges.
 - Kafka consumer lag over time, PS CPU, DB connections and query rate.
 
@@ -138,10 +154,11 @@ Discussed as optional extras: Kafka with 1 partition vs N partitions (partitions
 ## 8. Open decisions (ask the user; do not assume)
 
 1. **Language/framework** for OS, PS and the gateway mock: Node.js, Java/Spring Boot or Go. Preferably the user's work stack.
-2. **Cloud provider and region.** The diagram currently shows `asia-southeast2` as an example only.
-3. **Budget ceiling:** about $5–15 total was proposed but not confirmed.
-4. **Scope:** all 4 scenarios × 3 flows, or start smaller.
-5. Whether to delete the obsolete RabbitMQ draft files.
+2. **Region is confirmed only after the quota check:** `asia-southeast2` is the plan, but Phase 0.4 of the execution plan may force another region if the free-trial quota or machine types don't fit.
+3. **Scope:** the full 3 flows × 5 scenarios × 3–5 runs, or start smaller.
+4. Whether to delete the obsolete RabbitMQ draft files.
+
+Decided: **Google Cloud Free Trial** (2026-10-01). Budget is the $300 trial credit, with a $30 budget alert.
 
 ## 9. Working agreements with the user
 
